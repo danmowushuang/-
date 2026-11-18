@@ -13,6 +13,7 @@ import os
 import sys
 import json
 import time
+import math
 import ctypes
 import shutil
 import threading
@@ -45,6 +46,8 @@ CFG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), 
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
 RECT_FILE = os.path.join(CFG_DIR, "rects.json")
 PID_FILE = os.path.join(CFG_DIR, "run.pid")
+LOCK_FILE = os.path.join(CFG_DIR, "instance.lock")
+STRUCT_FILE = os.path.join(CFG_DIR, "structure.json")
 AUDIT_FILE = os.path.join(CFG_DIR, "audit.log")
 ERROR_LOG = os.path.join(CFG_DIR, "error.log")
 
@@ -80,6 +83,25 @@ def usage_color(pct):
     if pct >= 70:
         return AMBER
     return GREEN
+
+
+# 环上分段配色（依次给最大的目录）
+SEG_COLORS = ("#f2c14e", "#f2703f", "#ef72a4", "#9b8cf2", "#4c9cf2", "#4ecb8f", "#5ad1d8")
+SEG_OTHER = "#7d90a6"   # 其余零碎项
+SEG_SYS = "#46586c"     # 系统占用 / 读不到的部分
+SEG_FREE = "#243141"    # 剩余空间
+
+
+def brighten(hex_color, ratio=0.35):
+    try:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except Exception:
+        return hex_color
+    r = int(r + (255 - r) * ratio)
+    g = int(g + (255 - g) * ratio)
+    b = int(b + (255 - b) * ratio)
+    return "#%02x%02x%02x" % (r, g, b)
 
 
 def elide(s, n=34):
@@ -153,6 +175,29 @@ def alive(pid):
     except Exception:
         pass
     return False
+
+
+_lock_handle = None
+
+
+def acquire_single_instance():
+    """用文件独占锁判断单实例：进程退出锁自动释放，不会因 PID 被回收而误判。"""
+    global _lock_handle
+    try:
+        f = open(LOCK_FILE, "a+")
+    except Exception:
+        return True
+    try:
+        import msvcrt
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except Exception:
+        try:
+            f.close()
+        except Exception:
+            pass
+        return False
+    _lock_handle = f
+    return True
 
 
 # ---------------------------------------------------------------- 磁盘
@@ -717,15 +762,30 @@ class BallApp(tk.Tk):
         self._photo = None
         self._drag_from = None
         self._moved = False
+        # 环上分段（按目录大小着色）
+        self.segments = []
+        self.hover_seg = None
+        self.struct_items = None
+        self.struct_ts = 0
+        self._struct_busy = False
+        self._struct_token = 0
+        self._sq = queue.Queue()
+        self._tip_key = None
+        self._tip_state = None
+        self._mouse = (0, 0)
+        self._demo_hover = False
 
         cfg = load_json(CFG_FILE, {})
         self._cfg = cfg
         self._place_from_cfg(cfg)
         self._bind()
+        self.after(300, self._load_struct_cache)
 
         self.after(10, self.refresh_drives)
         self.after(60, self._animate)
         self.after(400, self.dump_rects)
+        self.after(1200, self.scan_structure)
+        self.after(250, self._poll_struct)
         self.after(1500, self._tick)
 
     # ---- 位置
@@ -762,6 +822,7 @@ class BallApp(tk.Tk):
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Button-3>", self._menu)
+        self.canvas.bind("<Motion>", self._motion)
         self.canvas.bind("<Enter>", self._enter)
         self.canvas.bind("<Leave>", self._leave)
 
@@ -813,13 +874,51 @@ class BallApp(tk.Tk):
 
     def _leave(self, e):
         self.hover = False
+        self.hover_seg = None
         self._render()
         self._hide_tip()
+
+    def _motion(self, e):
+        self._mouse = (e.x_root, e.y_root)
+        if self._drag_from:
+            return
+        idx = self._seg_at(e.x, e.y)
+        if idx == self.hover_seg:
+            if idx is not None:
+                self._position_tip()
+            return
+        self.hover_seg = idx
+        self.hover = True
+        self._render()
+        if idx is not None:
+            self._cancel_tip()
+            self._show_seg_tip(idx)
+        else:
+            self._hide_tip()
+            self._schedule_tip()
+
+    def _seg_at(self, x, y):
+        """按鼠标位置判断落在哪一段上（角度 + 半径双重判定）。"""
+        if not self.segments:
+            return None
+        S = float(self.size)
+        cx = cy = S / 2.0
+        dx, dy = x - cx, y - cy
+        dist = math.hypot(dx, dy)
+        r = 0.366 * S
+        wpx = max(3.0, 0.054 * S)
+        if abs(dist - r) > wpx / 2.0 + self.px(3):
+            return None
+        ang = (math.degrees(math.atan2(dy, dx)) + 90.0) % 360.0
+        for i, sg in enumerate(self.segments):
+            if sg["start"] <= ang < sg["end"]:
+                return i
+        return None
 
     # ---- 悬浮提示
     def _schedule_tip(self):
         self._cancel_tip()
-        self._tip_job = self.after(400, self._show_tip)
+        self._tip_job = self.after(400, self._show_drive_tip)
 
     def _cancel_tip(self):
         if self._tip_job:
@@ -831,6 +930,7 @@ class BallApp(tk.Tk):
 
     def _hide_tip(self):
         self._cancel_tip()
+        self._tip_state = None
         if self.tip is not None:
             try:
                 self.tip.destroy()
@@ -838,10 +938,15 @@ class BallApp(tk.Tk):
                 pass
             self.tip = None
 
-    def _show_tip(self):
+    def _show_drive_tip(self):
         if not self.hover or not self.drives:
             return
+        state = ("drive", tuple(round(d.pct, 1) for d in self.drives))
+        if self.tip is not None and self._tip_state == state:
+            return
         self._hide_tip()
+        self._tip_key = "drive"
+        self._tip_state = state
         tip = tk.Toplevel(self)
         tip.overrideredirect(True)
         tip.attributes("-topmost", True)
@@ -873,6 +978,66 @@ class BallApp(tk.Tk):
         tip.geometry("+%d+%d" % (x, y))
         self.tip = tip
 
+    def _show_seg_tip(self, idx):
+        """鼠标停在环上某一段时的小浮框：色块 + 名称 + 体积 + 占比。"""
+        if not (0 <= idx < len(self.segments)):
+            return
+        sg = self.segments[idx]
+        drv = self._main_drive()
+        total = float(drv.total) if (drv and drv.total) else 0.0
+        state = ("seg", idx, round(sg["size"] / 1048576.0, 1), len(self.segments))
+        if self.tip is not None and self._tip_state == state:
+            self._position_tip()
+            return
+        self._hide_tip()
+        self._tip_key = "seg:%d" % idx
+        self._tip_state = state
+        tip = tk.Toplevel(self)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tip.configure(bg=LINE)
+        box = tk.Frame(tip, bg=PANEL)
+        box.pack(padx=1, pady=1)
+        head = tk.Frame(box, bg=PANEL)
+        head.pack(fill="x", padx=self.px(9), pady=(self.px(7), self.px(1)))
+        dot = tk.Canvas(head, width=self.px(9), height=self.px(9), bg=PANEL,
+                        highlightthickness=0)
+        dot.create_oval(1, 1, self.px(8), self.px(8), fill=sg["color"], outline="")
+        dot.pack(side="left", pady=(self.px(3), 0))
+        tk.Label(head, text="  " + elide(sg["name"], 18), bg=PANEL, fg=TEXT,
+                 font=("Microsoft YaHei UI", -self.px(11), "bold")).pack(side="left")
+        detail = fmt_size(sg["size"])
+        if total > 0:
+            detail += "   占全盘 %.1f%%" % (sg["size"] / total * 100.0)
+        tk.Label(box, text="  " + detail, bg=PANEL, fg=MUTED,
+                 font=("Microsoft YaHei UI", -self.px(10))).pack(
+            anchor="w", padx=self.px(9), pady=(0, self.px(7)))
+        self.tip = tip
+        self._position_tip()
+
+    def _position_tip(self):
+        if self.tip is None:
+            return
+        try:
+            self.tip.update_idletasks()
+            w = self.tip.winfo_reqwidth()
+            h = self.tip.winfo_reqheight()
+        except Exception:
+            return
+        mx, my = self._mouse
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # 贴在球的外侧，避免小框盖住环和中间的数字
+        bx, by = self.winfo_x(), self.winfo_y()
+        x = bx + self.size + self.px(6)
+        y = my - self.px(18)
+        if x + w > sw - self.px(6):
+            x = bx - w - self.px(6)
+        if y + h > sh - self.px(6):
+            y = sh - h - self.px(6)
+        if y < self.px(6):
+            y = self.px(6)
+        self.tip.geometry("+%d+%d" % (max(0, x), max(0, y)))
+
     # ---- 数据
     def refresh_drives(self, first=False):
         prev = {d.root: d for d in self.drives}
@@ -890,6 +1055,7 @@ class BallApp(tk.Tk):
                 self.main = sysroot if sysroot in roots else roots[0]
             d = self._main_drive()
             self.target = d.pct if d else 0.0
+        self._build_segments()
         self._render()
         if self.detail is not None and self.detail.winfo_exists():
             self.detail.refresh_cards()
@@ -903,13 +1069,217 @@ class BallApp(tk.Tk):
     def _tick(self):
         self.refresh_drives()
         if self.tip is not None and self.hover:
-            self._show_tip()
+            if self._tip_key and self._tip_key.startswith("seg"):
+                if self.hover_seg is not None:
+                    self._show_seg_tip(self.hover_seg)
+            else:
+                self._show_drive_tip()
+        if not self._struct_busy and (time.time() - (self.struct_ts or 0)) > 900:
+            self.scan_structure()
         self.after(2000, self._tick)
 
     def force_refresh(self):
         self.refresh_drives()
         if self.detail is not None and self.detail.winfo_exists():
             self.detail.scan()
+        self.invalidate_structure()
+
+    # ---- 环上分段数据：当前盘根目录下各文件夹的体积
+    def scan_structure(self):
+        drv = self._main_drive()
+        if not drv:
+            self.after(1500, self.scan_structure)
+            return
+        if self._struct_busy:
+            return
+        self._struct_busy = True
+        self._struct_token += 1
+        baseline = list(self.struct_items or [])
+        threading.Thread(target=self._struct_worker,
+                         args=(drv.root, self._struct_token, baseline), daemon=True).start()
+
+    def _struct_worker(self, root, token, baseline):
+        """统计根目录各项体积。以 baseline（上次结果/缓存）为底稿，逐项更新，
+        这样重扫过程中环不会塌成一大片灰。"""
+        items = [dict(x) for x in (baseline or []) if x.get("path")]
+        pos = {it["path"]: i for i, it in enumerate(items)}
+        try:
+            entries = []
+            with os.scandir(root) as it:
+                for e in it:
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                        is_dir = e.is_dir(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if getattr(st, "st_file_attributes", 0) & SKIP_ATTR:
+                        continue
+                    entries.append((e.name, e.path, is_dir, st.st_size))
+        except OSError:
+            self._sq.put(("done", token, items))
+            return
+        for name, path, is_dir, size in entries:
+            if not is_dir:
+                if path in pos:
+                    items[pos[path]]["size"] = size
+                else:
+                    pos[path] = len(items)
+                    items.append({"name": name, "path": path, "size": size})
+        self._sq.put(("partial", token, [dict(x) for x in items]))
+        dirs = [(n, p) for n, p, is_dir, _s in entries if is_dir]
+        if dirs:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = {ex.submit(dir_size, p): (n, p) for n, p in dirs}
+                for f in as_completed(futs):
+                    if token != self._struct_token:
+                        return
+                    n, p = futs[f]
+                    try:
+                        size = f.result()
+                    except Exception:
+                        size = 0
+                    if p in pos:
+                        items[pos[p]]["size"] = size
+                        items[pos[p]]["name"] = n
+                    else:
+                        pos[p] = len(items)
+                        items.append({"name": n, "path": p, "size": size})
+                    self._sq.put(("partial", token, [dict(x) for x in items]))
+        alive_paths = {p for _n, p, _d, _s in entries}
+        items = [x for x in items if x.get("path") in alive_paths]
+        self._sq.put(("done", token, items))
+
+    def _poll_struct(self):
+        changed = False
+        finished = False
+        try:
+            while True:
+                msg = self._sq.get_nowait()
+                if len(msg) < 3 or msg[1] != self._struct_token:
+                    continue
+                if msg[0] == "partial":
+                    self.struct_items = msg[2]
+                    changed = True
+                elif msg[0] == "done":
+                    self.struct_items = msg[2]
+                    self._struct_busy = False
+                    self.struct_ts = time.time()
+                    changed = True
+                    finished = True
+                    self._save_struct_cache(self.main)
+        except queue.Empty:
+            pass
+        try:
+            if changed:
+                self._build_segments()
+                self._render()
+            mode = os.environ.get("DISKBALL_DEMO_HOVER")
+            if changed and mode and not self._demo_hover and self.segments:
+                self._demo_hover = True
+                self.hover = True
+                idx = min(1, len(self.segments) - 1)
+                sg = self.segments[idx]
+                mid = math.radians((sg["start"] + sg["end"]) / 2.0 - 90.0)
+                r = 0.366 * self.size
+                x = self.size / 2.0 + r * math.cos(mid)
+                y = self.size / 2.0 + r * math.sin(mid)
+                if mode == "2":     # 走真实的鼠标命中逻辑
+                    self.canvas.event_generate(
+                        "<Motion>", x=int(x), y=int(y),
+                        rootx=int(self.winfo_rootx() + x),
+                        rooty=int(self.winfo_rooty() + y))
+                else:               # 直接指定某一段，便于截图
+                    self.hover_seg = idx
+                    self._mouse = (self.winfo_rootx() + int(x) + self.px(10),
+                                   self.winfo_rooty() + int(y) + self.px(10))
+                    self._render()
+                    self._show_seg_tip(idx)
+        except Exception:
+            pass
+        finally:
+            self.after(250, self._poll_struct)
+
+    def invalidate_structure(self, delay=800):
+        self.struct_ts = 0
+        self.after(delay, self.scan_structure)
+
+    def _load_struct_cache(self):
+        """启动时先用上次的结果把彩色环画出来，不必等几分钟扫描。"""
+        if self.struct_items:
+            return
+        data = load_json(STRUCT_FILE, None)
+        if not isinstance(data, dict):
+            return
+        items = data.get("items") or []
+        root = data.get("root") or ""
+        if root and self.main and root.upper() != self.main.upper():
+            return
+        if not items:
+            return
+        self.struct_items = items
+        self._build_segments()
+        self._render()
+
+    def _save_struct_cache(self, root):
+        items = self.struct_items or []
+        if not items:
+            return
+        try:
+            top = sorted(items, key=lambda x: -(x.get("size") or 0))[:120]
+            save_json(STRUCT_FILE, {"root": root, "ts": time.time(),
+                                    "items": [{"name": i.get("name"),
+                                               "path": i.get("path"),
+                                               "size": int(i.get("size") or 0)}
+                                              for i in top]})
+        except Exception:
+            pass
+
+    def _build_segments(self):
+        """把根目录各项按体积切成环上的色段（含“其他/系统/剩余”）。"""
+        drv = self._main_drive()
+        items = self.struct_items or []
+        if not drv or not items or not drv.total:
+            self.segments = []
+            self.hover_seg = None
+            return
+        total = float(drv.total)
+        used = float(drv.used or 0)
+        parts = []
+        for it in items:
+            size = it.get("size") or 0
+            if size >= total * 0.012:      # 不足 1.2% 的零碎项并进“其他”
+                parts.append({"name": it.get("name") or "?", "path": it.get("path"),
+                              "size": float(size)})
+        parts.sort(key=lambda x: -x["size"])
+        top, tail = parts[:7], parts[7:]
+        segs = []
+        for i, it in enumerate(top):
+            segs.append({"name": it["name"], "path": it["path"], "size": it["size"],
+                         "color": SEG_COLORS[i % len(SEG_COLORS)]})
+        rest = sum(x["size"] for x in tail)
+        if rest > 0:
+            segs.append({"name": "其他小项", "path": None, "size": rest, "color": SEG_OTHER})
+        known = sum(s["size"] for s in segs)
+        gap = used - known
+        if gap > total * 0.008:
+            segs.append({"name": "系统 / 未统计", "path": None, "size": gap, "color": SEG_SYS})
+        free = max(0.0, total - used)
+        if free > 0:
+            segs.append({"name": "剩余空间", "path": None, "size": free,
+                         "color": SEG_FREE, "free": True})
+        span = sum(s["size"] for s in segs)
+        if span <= 0:
+            self.segments = []
+            return
+        acc = 0.0
+        for s in segs:
+            s["start"] = acc
+            acc += s["size"] / span * 360.0
+            s["end"] = min(360.0, acc)
+        segs[-1]["end"] = 360.0
+        self.segments = segs
+        if self.hover_seg is not None and self.hover_seg >= len(segs):
+            self.hover_seg = None
 
     # ---- 动效
     def _animate(self):
@@ -941,20 +1311,40 @@ class BallApp(tk.Tk):
         pct = self.pct
         color = usage_color(drv.pct if drv else 0)
 
-        # 环形进度
+        # 环形：按目录大小分段着色（无数据时退回单色进度环）
         r = 0.366 * W
         wpx = max(3, int(0.054 * W))
         box = (cx - r, cy - r, cx + r, cy + r)
-        d.arc(box, -90, 270, fill=(35, 50, 71, 255), width=wpx)
-        sweep = max(0.0, min(100.0, pct)) * 3.6
-        if sweep > 0.6:
-            d.arc(box, -90, -90 + sweep, fill=color, width=wpx)
-            import math
-            for ang in (-90.0, -90.0 + sweep):
-                a = math.radians(ang)
-                px_, py_ = cx + r * math.cos(a), cy + r * math.sin(a)
-                rr = wpx / 2.0
-                d.ellipse((px_ - rr, py_ - rr, px_ + rr, py_ + rr), fill=color)
+        if self.segments:
+            for i, sg in enumerate(self.segments):
+                a0 = -90.0 + sg["start"]
+                a1 = -90.0 + sg["end"]
+                span_deg = sg["end"] - sg["start"]
+                pad = 1.5 if span_deg >= 10 else (0.9 if span_deg >= 4 else 0.15)
+                s0, s1 = a0 + pad, a1 - pad
+                if s1 - s0 < 0.06:
+                    s1 = s0 + 0.06
+                col = sg["color"]
+                if self.hover_seg == i:
+                    col = brighten(col, 0.4)
+                d.arc(box, s0, s1, fill=col, width=wpx)
+                arclen = math.radians(s1 - s0) * r
+                if arclen > wpx * 1.2 and not sg.get("free"):
+                    rr = wpx / 2.0
+                    for ang in (s0, s1):
+                        a = math.radians(ang)
+                        px_, py_ = cx + r * math.cos(a), cy + r * math.sin(a)
+                        d.ellipse((px_ - rr, py_ - rr, px_ + rr, py_ + rr), fill=col)
+        else:
+            d.arc(box, -90, 270, fill=(35, 50, 71, 255), width=wpx)
+            sweep = max(0.0, min(100.0, pct)) * 3.6
+            if sweep > 0.6:
+                d.arc(box, -90, -90 + sweep, fill=color, width=wpx)
+                for ang in (-90.0, -90.0 + sweep):
+                    a = math.radians(ang)
+                    px_, py_ = cx + r * math.cos(a), cy + r * math.sin(a)
+                    rr = wpx / 2.0
+                    d.ellipse((px_ - rr, py_ - rr, px_ + rr, py_ + rr), fill=color)
 
         small = self.design < 118
         if drv:
@@ -2097,6 +2487,7 @@ class DetailWindow(tk.Toplevel):
         self._update_sel()
         self.status.configure(text=msg, fg=GREEN)
         self.app.refresh_drives()
+        self.app.invalidate_structure(1500)
         self.refresh_cards()
         self.scan()
 
@@ -2144,6 +2535,7 @@ class DetailWindow(tk.Toplevel):
 
     def _after_cleaned(self, freed, removed, skipped):
         self.app.refresh_drives()
+        self.app.invalidate_structure(1500)
         self.refresh_cards()
         self.scan_clean()
         self.status.configure(
@@ -2167,13 +2559,8 @@ class DetailWindow(tk.Toplevel):
 def main():
     enable_dpi()
 
-    if os.path.exists(PID_FILE):
-        try:
-            old = int(open(PID_FILE).read().strip())
-            if alive(old):
-                sys.exit(0)
-        except Exception:
-            pass
+    if not acquire_single_instance():
+        sys.exit(0)
     try:
         os.makedirs(CFG_DIR, exist_ok=True)
         with open(PID_FILE, "w") as f:
