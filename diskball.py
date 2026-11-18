@@ -128,6 +128,57 @@ def colorref(hexcolor):
     return b << 16 | g << 8 | r
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "DiskBall"
+
+
+def _launcher_exe():
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        exe = exe[:-len("python.exe")] + "pythonw.exe"
+    return exe
+
+
+def _script_path():
+    return os.path.abspath(__file__)
+
+
+def autostart_enabled():
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY)
+        try:
+            val, _t = winreg.QueryValueEx(k, RUN_VALUE)
+            return bool(val)
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(k)
+    except Exception:
+        return False
+
+
+def set_autostart(on):
+    """开机自启动：写 HKCU 的 Run 键（不需要管理员，随时可撤）。"""
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if on:
+                winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ,
+                                  '"%s" "%s"' % (_launcher_exe(), _script_path()))
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_VALUE)
+                except FileNotFoundError:
+                    pass
+        finally:
+            winreg.CloseKey(k)
+        return True
+    except Exception:
+        return False
+
+
 def load_json(path, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -648,6 +699,33 @@ def ring_photo(size, pct, color, width=9, track="#233247", bgcolor=KEY, cap=True
     return ImageTk.PhotoImage(bg)
 
 
+def ring_photo_seg(size, parts, width=9, track="#233247", bgcolor=KEY):
+    """按比例分段着色的圆环。parts = [(占比, 颜色), ...]，没占满的部分用 track 补。"""
+    ss = 3
+    W = int(size) * ss
+    img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    r = (W - width * ss) / 2.0 - ss
+    box = (W / 2 - r, W / 2 - r, W / 2 + r, W / 2 + r)
+    wpx = int(width * ss)
+    d.arc(box, -90, 270, fill=track, width=wpx)
+    acc = 0.0
+    for frac, color in parts:
+        sweep = max(0.0, float(frac)) * 360.0
+        if sweep <= 0.6:
+            acc += sweep
+            continue
+        a0 = -90.0 + acc
+        a1 = a0 + sweep
+        pad = 0.9 if sweep > 8 else 0.15
+        d.arc(box, a0 + pad, a1 - pad, fill=color, width=wpx)
+        acc += sweep
+    out = img.resize((int(size), int(size)), Image.LANCZOS)
+    bg = Image.new("RGB", out.size, bgcolor)
+    bg.paste(out, (0, 0), out)
+    return ImageTk.PhotoImage(bg)
+
+
 # ---------------------------------------------------------------- 通用小部件
 class SlimScroll(tk.Canvas):
     """细长自绘滚动条。"""
@@ -750,6 +828,7 @@ class BallApp(tk.Tk):
         self.canvas.configure(width=self.size, height=self.size)
         self.canvas.coords(self.img_id, self.size // 2, self.size // 2)
         self._size_var = tk.IntVar(value=self.design)
+        self._auto_var = tk.BooleanVar(value=autostart_enabled())
 
         self.drives = []
         self.main = None
@@ -860,6 +939,8 @@ class BallApp(tk.Tk):
                                   variable=self._size_var,
                                   command=lambda v=val: self.set_size(v))
         m.add_cascade(label="  小球大小      ", menu=sizes)
+        m.add_checkbutton(label="  开机自启动    ", variable=self._auto_var,
+                          command=self._toggle_autostart)
         m.add_separator()
         m.add_command(label="  退出          ", command=self.quit_app)
         try:
@@ -867,11 +948,15 @@ class BallApp(tk.Tk):
         finally:
             m.grab_release()
 
+    def _toggle_autostart(self):
+        want = bool(self._auto_var.get())
+        set_autostart(want)
+        self._auto_var.set(autostart_enabled())
+
     def _enter(self, e):
         self.hover = True
         self._render()
         self._schedule_tip()
-
     def _leave(self, e):
         self.hover = False
         self.hover_seg = None
@@ -1459,8 +1544,12 @@ class Row:
         self.ico.pack(side="left", padx=(0, w.px(10)))
         self._draw_icon()
 
-        # 名称
-        self.name = tk.Label(self.frame, text=elide(item["name"], 40), bg=BG, fg=TEXT,
+        # 名称（最近新增模式下带时间）
+        note = item.get("note")
+        title = elide(item["name"], 34)
+        if note:
+            title = "%s   %s" % (title, note)
+        self.name = tk.Label(self.frame, text=title, bg=BG, fg=TEXT,
                              font=("Microsoft YaHei UI", -w.px(12)), anchor="w")
         self.name.pack(side="left", fill="x", expand=True)
 
@@ -1605,6 +1694,13 @@ class Confirm(tk.Toplevel):
 # ---------------------------------------------------------------- 详情窗
 class DetailWindow(tk.Toplevel):
     BAR_W = 168
+    RECENT_DAYS = 30
+    MIN_RECENT = 20 * 1024 * 1024      # 只看 20MB 以上的新增文件
+    MAX_RECENT = 300
+    # 这些目录里"新增"的多是系统更新/缓存产生的，不是用户新装的东西
+    SKIP_DIRS = {"$recycle.bin", "system volume information", "recovery", "perflogs",
+                 "windows", "temp", "tmp", "winsxs", "softwaredistribution",
+                 "node_modules", "__pycache__", ".git", "cache", "cache2", "code cache"}
 
     def __init__(self, app):
         super().__init__(app)
@@ -1648,14 +1744,27 @@ class DetailWindow(tk.Toplevel):
         self.bind("<F5>", lambda e: self.scan())
         self.deiconify()
         self.lift()
+        self.after(120, self._ensure_visible)
+        self.after(700, self._ensure_visible)
         self.after(200, lambda: self.scan())
         self.after(100, self._poll_loop)
         self.after(150, app.dump_rects)
         if os.environ.get("DISKBALL_DEMO_CLEAN") == "1":
             self.after(1500, lambda: self.set_mode("clean"))
+        if os.environ.get("DISKBALL_DEMO_RECENT") == "1":
+            self.after(1500, lambda: self.set_mode("recent"))
 
     def px(self, v):
         return int(round(v * self.scale))
+
+    def _ensure_visible(self):
+        """偶发被系统最小化/隐藏时，强制恢复成一个正常窗口。"""
+        try:
+            if self.state() in ("iconic", "withdrawn"):
+                self.deiconify()
+            self.lift()
+        except Exception:
+            pass
 
     def _apply_titlebar(self):
         try:
@@ -1706,7 +1815,7 @@ class DetailWindow(tk.Toplevel):
             self._build_card(d)
         legend = tk.Frame(self.left, bg=BG)
         legend.pack(side="bottom", fill="x", padx=self.px(14), pady=self.px(10))
-        tk.Label(legend, text="环色说明  正常 / 偏紧 70% / 告急 85%", bg=BG, fg=DIM,
+        tk.Label(legend, text="主盘环 = 各目录占比 · 其它盘 = 紧张程度", bg=BG, fg=DIM,
                  font=F(9)).pack(anchor="w")
 
         # 右：内容
@@ -1738,8 +1847,12 @@ class DetailWindow(tk.Toplevel):
         self.seg_big = tk.Label(self.seg_box, text="  大文件 100MB+  ", bg=CARD, fg=MUTED,
                                 cursor="hand2", font=F(11), pady=self.px(3))
         self.seg_big.pack(side="left")
+        self.seg_recent = tk.Label(self.seg_box, text="  最近新增  ", bg=CARD, fg=MUTED,
+                                   cursor="hand2", font=F(11), pady=self.px(3))
+        self.seg_recent.pack(side="left")
         self.seg_dir.bind("<Button-1>", lambda e: self.set_mode("dir"))
         self.seg_big.bind("<Button-1>", lambda e: self.set_mode("big"))
+        self.seg_recent.bind("<Button-1>", lambda e: self.set_mode("recent"))
         self.seg_clean = tk.Label(self.seg_box, text="  推荐清理  ", bg=CARD, fg=MUTED,
                                   cursor="hand2", font=F(11), pady=self.px(3))
         self.seg_clean.pack(side="left")
@@ -1753,8 +1866,9 @@ class DetailWindow(tk.Toplevel):
         self.th.pack(fill="x")
         self.th.pack_propagate(False)
         tk.Label(self.th, text="名称", bg=BG, fg=DIM, font=F(10)).pack(side="left", padx=(self.px(42), 0))
-        tk.Label(self.th, text="占本盘", bg=BG, fg=DIM, font=F(10), width=7, anchor="e").pack(
-            side="right", padx=(self.px(8), self.px(14)))
+        self.th_pct = tk.Label(self.th, text="占本盘", bg=BG, fg=DIM, font=F(10), width=7,
+                               anchor="e")
+        self.th_pct.pack(side="right", padx=(self.px(8), self.px(14)))
         tk.Label(self.th, text="大小", bg=BG, fg=DIM, font=F(10), width=10, anchor="e").pack(
             side="right", padx=(self.px(6), 0))
         tk.Label(self.th, text="相对大小", bg=BG, fg=DIM, font=F(10)).pack(side="right",
@@ -2019,9 +2133,22 @@ class DetailWindow(tk.Toplevel):
         ref["pct"].configure(text="已用 %s  ·  剩 %s" % (fmt_pct(d.pct), fmt_size(d.free)))
         ref["sub"].configure(text="%s / %s" % (fmt_size(d.used), fmt_size(d.total)))
         ref["ring"].delete("all")
-        ref["ring"].image = ring_photo(self.px(48), d.pct, usage_color(d.pct),
-                                       width=self.px(7), bgcolor=bg, track="#2c3f58")
+        parts = self._seg_parts(d)
+        if parts:
+            ref["ring"].image = ring_photo_seg(self.px(48), parts, width=self.px(7),
+                                               bgcolor=bg, track="#2c3f58")
+        else:
+            ref["ring"].image = ring_photo(self.px(48), d.pct, usage_color(d.pct),
+                                           width=self.px(7), bgcolor=bg, track="#2c3f58")
         ref["ring"].create_image(self.px(24), self.px(24), image=ref["ring"].image)
+
+    def _seg_parts(self, d):
+        """主盘的圆环按目录分色，其它盘还是按紧张程度单色。"""
+        segs = getattr(self.app, "segments", None)
+        if not segs or not d.total or d.root != getattr(self.app, "main", None):
+            return None
+        parts = [(sg["size"] / float(d.total), sg["color"]) for sg in segs if not sg.get("free")]
+        return parts or None
 
     def refresh_cards(self):
         for d in list(self.drives):
@@ -2067,11 +2194,20 @@ class DetailWindow(tk.Toplevel):
         self.clean_sel = set()
         self._update_sel()
         self._sync_seg()
+        self.th_pct.configure(text="占新增" if mode == "recent" else "占本盘")
         self._switch_view()
         if mode == "clean":
             self._update_path()
             self.path_label.configure(text="清理建议")
             self.scan_clean()
+        elif mode == "recent":
+            # 最近新增：默认看整个当前盘
+            root = "%s\\" % self.cur_path[0].upper()
+            if root not in [d.root for d in self.drives]:
+                root = self.cur_path
+            self.cur_path = root
+            self.history = []
+            self.scan()
         else:
             self._update_path()
             self.scan()
@@ -2079,13 +2215,19 @@ class DetailWindow(tk.Toplevel):
     def _sync_seg(self):
         on = ("#173243", ACCENT)
         off = (CARD, MUTED)
-        for lbl, key in ((self.seg_dir, "dir"), (self.seg_big, "big"), (self.seg_clean, "clean")):
+        for lbl, key in ((self.seg_dir, "dir"), (self.seg_big, "big"),
+                         (self.seg_recent, "recent"), (self.seg_clean, "clean")):
             if self.mode == key:
                 lbl.configure(bg=on[0], fg=on[1])
             else:
                 lbl.configure(bg=off[0], fg=off[1])
 
     def _update_path(self):
+        if self.mode == "recent":
+            self.path_label.configure(
+                text="最近 %d 天新增的文件 · %s" % (self.RECENT_DAYS, self.cur_path))
+            self.back_btn.configure(fg=DIM)
+            return
         d = next((x for x in self.drives if self.cur_path.upper().startswith(x.letter)), None)
         self.path_label.configure(text=elide(self.cur_path, 70))
         self.back_btn.configure(fg=TEXT if self.history else DIM)
@@ -2108,8 +2250,10 @@ class DetailWindow(tk.Toplevel):
         self._update_path()
         if self.mode == "dir":
             threading.Thread(target=self._scan_dir, args=(self.cur_path, token), daemon=True).start()
-        else:
+        elif self.mode == "big":
             threading.Thread(target=self._scan_big, args=(self.cur_path, token), daemon=True).start()
+        else:
+            threading.Thread(target=self._scan_recent, args=(self.cur_path, token), daemon=True).start()
 
     def _stop(self, token):
         return token != self.cancelled
@@ -2199,11 +2343,51 @@ class DetailWindow(tk.Toplevel):
         if not self._stop(token):
             self.q.put(("bigdone", token, count, found))
 
+    def _scan_recent(self, path, token):
+        """扫整个盘，挑出最近 N 天新建、20MB 以上的文件，按时间从新到旧。"""
+        cutoff = time.time() - self.RECENT_DAYS * 86400
+        found = []
+        count = 0
+        last_post = 0.0
+        stack = [path]
+        while stack:
+            if self._stop(token):
+                return
+            cur = stack.pop()
+            try:
+                with os.scandir(cur) as it:
+                    for e in it:
+                        count += 1
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                            if getattr(st, "st_file_attributes", 0) & SKIP_ATTR:
+                                continue
+                            if e.is_dir(follow_symlinks=False):
+                                if e.name.lower() in self.SKIP_DIRS:
+                                    continue
+                                stack.append(e.path)
+                            elif st.st_size >= self.MIN_RECENT and st.st_ctime >= cutoff:
+                                found.append({"name": e.name, "path": e.path, "is_dir": False,
+                                              "size": st.st_size, "ctime": st.st_ctime})
+                                found.sort(key=lambda x: -x["ctime"])
+                                del found[self.MAX_RECENT:]
+                        except OSError:
+                            pass
+                        now = time.time()
+                        if now - last_post > 2.0:
+                            last_post = now
+                            self.q.put(("recentprog", token, count, list(found)))
+            except OSError:
+                pass
+        if not self._stop(token):
+            self.q.put(("recentdone", token, count, found))
+
     def _poll_loop(self):
         try:
             while True:
                 msg = self.q.get_nowait()
                 if msg[0] in ("reset", "size", "prog", "done", "error", "bigprog", "bigdone",
+                              "recentprog", "recentdone",
                               "deleted", "clean_size", "clean_done", "cleaned"):
                     if msg[1] != self.token:
                         continue
@@ -2245,6 +2429,12 @@ class DetailWindow(tk.Toplevel):
         elif kind == "bigdone":
             self.scanning = False
             self._render_big(msg[3], scanning=False, count=msg[2])
+        elif kind == "recentprog":
+            self.scanned_files = msg[2]
+            self._render_recent(msg[3], scanning=True, count=msg[2])
+        elif kind == "recentdone":
+            self.scanning = False
+            self._render_recent(msg[3], scanning=False, count=msg[2])
         elif kind == "deleted":
             ok, text = msg[2], msg[3]
             if ok:
@@ -2320,6 +2510,26 @@ class DetailWindow(tk.Toplevel):
             else "共 %d 个大于 %s 的文件" % (len(found), fmt_size(MIN_BIG_FILE)),
             fg=ACCENT if scanning else MUTED)
 
+    def _render_recent(self, found, scanning, count):
+        self._clear_rows()
+        shown = found[:60] if scanning else found      # 扫描中只画前 60 条，避免一直重建
+        for it in shown:
+            it["note"] = time.strftime("%m-%d %H:%M", time.localtime(it.get("ctime") or 0))
+        self.items = found
+        total = sum(x["size"] for x in found) or 1      # 占比按“本批新增”算
+        self.max_size = max([x["size"] for x in found] + [1])
+        if not shown:
+            self._empty("还没发现最近 %d 天新增的文件（已扫描 %s 个）" %
+                        (self.RECENT_DAYS, "{:,}".format(count)))
+        else:
+            for it in shown:
+                self._add_row(it, total)
+            self._update_summary_line()
+        self.status.configure(
+            text=("扫描中… 已扫 %s 个文件" % "{:,}".format(count)) if scanning
+            else "最近 %d 天新增 %d 个（≥%s）" % (self.RECENT_DAYS, len(found), fmt_size(self.MIN_RECENT)),
+            fg=ACCENT if scanning else MUTED)
+
     def _empty(self, text):
         tk.Label(self.inner, text=text, bg=BG, fg=DIM,
                  font=("Microsoft YaHei UI", -self.px(12))).pack(pady=self.px(40))
@@ -2330,6 +2540,8 @@ class DetailWindow(tk.Toplevel):
         used_here = sum(x["size"] for x in sizes)
         if self.mode == "dir":
             prefix = "本目录合计 %s" % fmt_size(used_here)
+        elif self.mode == "recent":
+            prefix = "最近 %d 天新增合计 %s" % (self.RECENT_DAYS, fmt_size(used_here))
         else:
             prefix = "大于 %s 的文件合计 %s" % (fmt_size(MIN_BIG_FILE), fmt_size(used_here))
         extra = ""
@@ -2558,6 +2770,14 @@ class DetailWindow(tk.Toplevel):
 # ---------------------------------------------------------------- 入口
 def main():
     enable_dpi()
+
+    errpath = os.environ.get("DISKBALL_ERRFILE")
+    if errpath:
+        try:
+            sys.stderr = open(errpath, "w", buffering=1, encoding="utf-8")
+            sys.stdout = sys.stderr
+        except Exception:
+            pass
 
     if not acquire_single_instance():
         sys.exit(0)
